@@ -1,0 +1,19 @@
+#Visual Studio
+bin/
+obj/
+Debug/
+Release/
+TestResults/
+.vs/
+
+*.suo
+*.sln.cache
+*.user
+*.dbmdl
+*.schemaview
+
+#Windows System Files
+desktop.ini
+
+#Program-Added (placeholder for entries added to the end of the file by applications) 
+
