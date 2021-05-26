@@ -9,9 +9,10 @@
  * 
  * Current Limitations:
  *    - The arrow keys don't work.
- *    - Occasionally a phantom cursor will appear in the history. I think this is a threading issue.
+ *    - Occasionally a phantom cursor will appear in the history.
  **************************************************************************************************/
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -30,66 +31,122 @@ namespace CmdWrapper
         private static Process _cmdProc;
         private static int _conHostProcId;
         private static ConsolePipe _consolePipe;
-        private static object _sync;
+        private static BlockingCollection<Action> _actionQueue;
         
         static void Main(string[] args)
+        {
+            _actionQueue = new BlockingCollection<Action>(new ConcurrentQueue<Action>());
+
+            Console.CancelKeyPress += OnCancelKeyPress;
+            MouseEvent += OnMouseEvent;
+
+            InitConsoleMode();
+            StartCmd();
+            CreatePipes();
+
+            StartConsoleListener();
+            RunActionLoop();
+        }
+
+        private static void InitConsoleMode()
         {
             IntPtr inHandle = GetStdHandle(STD_INPUT_HANDLE);
             uint mode = 0;
 
             GetConsoleMode(inHandle, ref mode);
 
-            Console.CancelKeyPress += CancelKeyPressHandler;
-
-            //mode &= ~ENABLE_PROCESSED_INPUT; //disable
             mode &= ~ENABLE_LINE_INPUT; //disable
-            mode &= ~ENABLE_QUICK_EDIT_MODE; //disable         
-            //mode |= ENABLE_WINDOW_INPUT; //enable (if you want)
+            mode &= ~ENABLE_QUICK_EDIT_MODE; //disable
             mode |= ENABLE_MOUSE_INPUT; //enable
 
             SetConsoleMode(inHandle, mode);
+        }
 
-            _cmdProc = Process.Start(new ProcessStartInfo
+        private static void StartCmd()
+        {
+            _cmdProc = new Process
             {
-                FileName = REAL_CMD_PATH,
-                Arguments = "/Q",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                RedirectStandardInput = true,
-                CreateNoWindow = true
-            });
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = REAL_CMD_PATH,
+                    Arguments = "/Q",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    RedirectStandardInput = true,
+                    CreateNoWindow = true
+                },
 
-            MouseEvent += MouseEventHandler;
-
-            var conOutput = Console.OpenStandardOutput();
-            _sync = new object();
-
-            _consolePipe = new ConsolePipe(conOutput, _cmdProc.StandardInput.BaseStream, _sync);
-
-            StreamPipe.Open(_cmdProc.StandardOutput.BaseStream, conOutput, _sync);
-            StreamPipe.Open(_cmdProc.StandardError.BaseStream, Console.OpenStandardError(), _sync);
-
-            StartConsoleListener();
+                EnableRaisingEvents = true
+            };
+            
+            _cmdProc.Exited += OnCmdProcExited;
+            _cmdProc.Start();
 
             _conHostProcId = GetConHostProcId();
+        }
 
-            _cmdProc.WaitForExit();
+        private static void CreatePipes()
+        {
+            var conOutput = Console.OpenStandardOutput();
+
+            _consolePipe = new ConsolePipe(conOutput, _cmdProc.StandardInput.BaseStream);
+
+            StreamPipe.Open(_cmdProc.StandardOutput.BaseStream, conOutput);
+            StreamPipe.Open(_cmdProc.StandardError.BaseStream, Console.OpenStandardError());
+        }
+
+        private static void RunActionLoop()
+        {
+            while (true)
+            {
+                Action action;
+
+                try
+                {
+                    action = _actionQueue.Take();
+                }
+                catch (InvalidOperationException)
+                {
+                    return;
+                }
+
+                try
+                {
+                    action();
+                }
+                catch (Exception e)
+                {
+                    Console.Error.WriteLine(e.Message);
+                }
+            }
+        }
+
+        private static void OnCmdProcExited(object sender, EventArgs e)
+        {
+            _actionQueue.CompleteAdding();
+        }
+
+        public static void DoInMainThread(Action action)
+        {
+            _actionQueue.Add(action);
         }
 
         private static int GetConHostProcId()
         {
-            while(true)
+            while (true)
             {
                 foreach (var childProc in EnumerateChildProcesses(_cmdProc))
                 {
                     if (childProc.ProcessName == "conhost")
                         return childProc.Id;
                 }
+
+                Thread.Sleep(100);
             }
         }
 
-        private static void CancelKeyPressHandler(object sender, ConsoleCancelEventArgs e)
+        private static void OnCancelKeyPress(object sender, ConsoleCancelEventArgs e)
         {
             foreach (var childProc in EnumerateChildProcesses(_cmdProc))
             {
@@ -100,25 +157,24 @@ namespace CmdWrapper
             e.Cancel = true;
         }
 
-        private static void MouseEventHandler(MOUSE_EVENT_RECORD r)
+        private static void OnMouseEvent(MOUSE_EVENT_RECORD r)
         {
             if ((r.dwButtonState & MOUSE_EVENT_RECORD.FROM_LEFT_1ST_BUTTON_PRESSED) == MOUSE_EVENT_RECORD.FROM_LEFT_1ST_BUTTON_PRESSED)
             {
-                lock (_sync)
+                var mouseX = r.dwMousePosition.X;
+                var mouseY = r.dwMousePosition.Y;
+
+                DoInMainThread(() =>
                 {
                     _consolePipe.EnableEditMode();
 
-                    var mouseY = r.dwMousePosition.Y;
-
                     if (mouseY < _consolePipe.CommandModeTop)
                     {
-                        Console.SetCursorPosition(r.dwMousePosition.X, mouseY);
+                        Console.SetCursorPosition(mouseX, mouseY);
                         return;
                     }
                     else if (mouseY == _consolePipe.CommandModeTop)
                     {
-                        var mouseX = r.dwMousePosition.X;
-
                         if (mouseX < _consolePipe.CommandModeLeft)
                         {
                             Console.SetCursorPosition(mouseX, mouseY);
@@ -127,7 +183,7 @@ namespace CmdWrapper
                     }
 
                     _consolePipe.EnableCommandMode();
-                }
+                });
             }
         }
 
@@ -143,6 +199,7 @@ namespace CmdWrapper
 
         private static void ConsoleListener()
         {
+            var keyEventProcessed = new AutoResetEvent(false);
             var handleIn = GetStdHandle(STD_INPUT_HANDLE);
             var buffer = new INPUT_RECORD[1];
             var record = buffer[0];
@@ -162,8 +219,20 @@ namespace CmdWrapper
                             break;
 
                         case INPUT_RECORD.KEY_EVENT:
-                            WriteConsoleInput(handleIn, buffer, 1, ref numRead);
-                            _consolePipe.Run();
+                            keyEventProcessed.Reset();
+
+                            DoInMainThread(() =>
+                            {
+                                uint numWritten = 0;
+
+                                WriteConsoleInput(handleIn, buffer, 1, ref numWritten);
+
+                                _consolePipe.Run();
+                                keyEventProcessed.Set();
+                            });
+
+                            keyEventProcessed.WaitOne();
+
                             break;
                     }
                 }
@@ -343,10 +412,10 @@ namespace CmdWrapper
 
     public class StreamPipe
     {
-        public static StreamPipe Open(Stream input, Stream output, object writeSync)
+        public static StreamPipe Open(Stream input, Stream output)
         {
-            var pipe = new StreamPipe(input, output, writeSync);
-            pipe.Open();
+            var pipe = new StreamPipe(input, output);
+            pipe.Run();
 
             return pipe;
         }
@@ -357,32 +426,29 @@ namespace CmdWrapper
 
         private Stream _input;
         private Stream _output;
-        private object _sync;
-
-        private StreamPipe(Stream input, Stream output, object sync)
+        
+        private StreamPipe(Stream input, Stream output)
         {
             _input = input;
             _output = output;
-            _sync = sync;
 
             _buffer = new byte[BUFFER_SIZE];
         }
 
-        private async void Open()
+        private async void Run()
         {
-            while (true)
+            var bytesRead = await _input.ReadAsync(_buffer, 0, BUFFER_SIZE);
+
+            if (bytesRead <= 0)
+                return;
+
+            Program.DoInMainThread(() =>
             {
-                var bytesRead = await _input.ReadAsync(_buffer, 0, BUFFER_SIZE);
+                _output.Write(_buffer, 0, bytesRead);
+                _output.Flush();
 
-                if (bytesRead <= 0)
-                    return;
-
-                lock (_sync)
-                {
-                    _output.Write(_buffer, 0, bytesRead);
-                    _output.Flush();
-                }
-            }
+                Run();
+            });
         }
     }
 
@@ -391,76 +457,71 @@ namespace CmdWrapper
         private StreamWriter _consoleWriter;
         private StreamWriter _cmdWriter;
         private StringBuilder _cmdBuffer;
-        private object _sync;
-
-        public ConsolePipe(Stream consoleStream, Stream cmdStream, object writeSync)
+        
+        public ConsolePipe(Stream consoleStream, Stream cmdStream)
         {
             _consoleWriter = new StreamWriter(consoleStream) { AutoFlush = true };
             _cmdWriter = new StreamWriter(cmdStream) { AutoFlush = true };
             _cmdBuffer = new StringBuilder(64);
-            _sync = writeSync;
         }
 
         public void Run()
         {
-            lock (_sync)
+            while (Console.KeyAvailable)
             {
-                while (Console.KeyAvailable)
+                var ch = (char)Console.Read();
+
+                switch (ch)
                 {
-                    var ch = (char)Console.Read();
+                    case '\r': //Return
 
-                    switch (ch)
-                    {
-                        case '\r': //Return
+                        if (Mode == ConsoleMode.Command)
+                        {
+                            _consoleWriter.WriteLine();
 
-                            if (Mode == ConsoleMode.Command)
-                            {
-                                _consoleWriter.WriteLine();
+                            ProcessCommand(_cmdBuffer.ToString());
 
-                                ProcessCommand(_cmdBuffer.ToString());
+                            _cmdBuffer.Clear();
+                        }
+                        else
+                        {
+                            EnableCommandMode();
+                        }
 
-                                _cmdBuffer.Clear();
-                            }
-                            else
-                            {
-                                EnableCommandMode();
-                            }
+                        break;
 
-                            break;
+                    case '\b': //Backspace
 
-                        case '\b': //Backspace
+                        switch (Mode)
+                        {
+                            case ConsoleMode.Command:
 
-                            switch (Mode)
-                            {
-                                case ConsoleMode.Command:
-
-                                    if (_cmdBuffer.Length > 0)
-                                    {
-                                        _consoleWriter.Write("\b \b");
-                                        
-                                        _cmdBuffer.Remove(_cmdBuffer.Length - 1, 1);
-                                    }
-
-                                    break;
-
-                                case ConsoleMode.Edit:
-
+                                if (_cmdBuffer.Length > 0)
+                                {
                                     _consoleWriter.Write("\b \b");
+                                        
+                                    _cmdBuffer.Remove(_cmdBuffer.Length - 1, 1);
+                                }
+
+                                break;
+
+                            case ConsoleMode.Edit:
+
+                                _consoleWriter.Write("\b \b");
                                     
-                                    break;
-                            }
+                                break;
+                        }
 
-                            break;
+                        break;
 
-                        default:
+                    default:
 
-                            _consoleWriter.Write(ch);
+                        _consoleWriter.Write(ch);
                             
-                            if (Mode == ConsoleMode.Command)
-                                _cmdBuffer.Append(ch);
+                        if (Mode == ConsoleMode.Command)
+                            _cmdBuffer.Append(ch);
 
-                            break;
-                    }
+                        break;
                 }
             }
         }
