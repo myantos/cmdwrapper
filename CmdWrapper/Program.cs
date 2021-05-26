@@ -12,8 +12,10 @@
  *    - Occasionally a phantom cursor will appear in the history. I think this is a threading issue.
  **************************************************************************************************/
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -25,6 +27,8 @@ namespace CmdWrapper
     {
         private const string REAL_CMD_PATH = @"C:\Windows\System32\cmd.exe";
 
+        private static Process _cmdProc;
+        private static int _conHostProcId;
         private static ConsolePipe _consolePipe;
         private static object _sync;
         
@@ -35,14 +39,17 @@ namespace CmdWrapper
 
             GetConsoleMode(inHandle, ref mode);
 
+            Console.CancelKeyPress += CancelKeyPressHandler;
+
+            //mode &= ~ENABLE_PROCESSED_INPUT; //disable
             mode &= ~ENABLE_LINE_INPUT; //disable
             mode &= ~ENABLE_QUICK_EDIT_MODE; //disable         
-            mode |= ENABLE_WINDOW_INPUT; //enable (if you want)
+            //mode |= ENABLE_WINDOW_INPUT; //enable (if you want)
             mode |= ENABLE_MOUSE_INPUT; //enable
 
             SetConsoleMode(inHandle, mode);
 
-            var cmdProc = Process.Start(new ProcessStartInfo
+            _cmdProc = Process.Start(new ProcessStartInfo
             {
                 FileName = REAL_CMD_PATH,
                 Arguments = "/Q",
@@ -58,14 +65,39 @@ namespace CmdWrapper
             var conOutput = Console.OpenStandardOutput();
             _sync = new object();
 
-            _consolePipe = new ConsolePipe(conOutput, cmdProc.StandardInput.BaseStream, _sync);
+            _consolePipe = new ConsolePipe(conOutput, _cmdProc.StandardInput.BaseStream, _sync);
 
-            StreamPipe.Open(cmdProc.StandardOutput.BaseStream, conOutput, _sync);
-            StreamPipe.Open(cmdProc.StandardError.BaseStream, Console.OpenStandardError(), _sync);
+            StreamPipe.Open(_cmdProc.StandardOutput.BaseStream, conOutput, _sync);
+            StreamPipe.Open(_cmdProc.StandardError.BaseStream, Console.OpenStandardError(), _sync);
 
             StartConsoleListener();
 
-            cmdProc.WaitForExit();
+            _conHostProcId = GetConHostProcId();
+
+            _cmdProc.WaitForExit();
+        }
+
+        private static int GetConHostProcId()
+        {
+            while(true)
+            {
+                foreach (var childProc in EnumerateChildProcesses(_cmdProc))
+                {
+                    if (childProc.ProcessName == "conhost")
+                        return childProc.Id;
+                }
+            }
+        }
+
+        private static void CancelKeyPressHandler(object sender, ConsoleCancelEventArgs e)
+        {
+            foreach (var childProc in EnumerateChildProcesses(_cmdProc))
+            {
+                if (childProc.Id != _conHostProcId)
+                    childProc.Kill();
+            }
+
+            e.Cancel = true;
         }
 
         private static void MouseEventHandler(MOUSE_EVENT_RECORD r)
@@ -139,6 +171,39 @@ namespace CmdWrapper
         }
 
         private delegate void ConsoleMouseEvent(MOUSE_EVENT_RECORD r);
+
+        private static IEnumerable<Process> EnumerateChildProcesses(Process process)
+        {
+            var scope = new ManagementScope();
+            scope.Connect();
+
+            if (scope.IsConnected)
+            {
+                var query = new ObjectQuery($"SELECT ProcessId FROM win32_process WHERE ParentProcessId={process.Id}");
+
+                using (var searcher = new ManagementObjectSearcher(scope, query))
+                using (var result = searcher.Get())
+                {
+                    Process proc;
+
+                    foreach (var item in result)
+                    {
+                        var procId = (uint)item["ProcessId"];
+
+                        try
+                        {
+                            proc = Process.GetProcessById((int)procId);
+                        }
+                        catch (ArgumentException)
+                        {
+                            continue;
+                        }
+
+                        yield return proc;
+                    }                    
+                }
+            }
+        }
     }
 
 
@@ -247,6 +312,7 @@ namespace CmdWrapper
         public const uint ENABLE_MOUSE_INPUT = 0x0010,
             ENABLE_QUICK_EDIT_MODE = 0x0040,
             ENABLE_EXTENDED_FLAGS = 0x0080,
+            ENABLE_PROCESSED_INPUT = 0x0001,
             ENABLE_LINE_INPUT = 0x0002,
             ENABLE_ECHO_INPUT = 0x0004,
             ENABLE_WINDOW_INPUT = 0x0008; //more
@@ -262,6 +328,17 @@ namespace CmdWrapper
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         public static extern bool WriteConsoleInput(IntPtr hConsoleInput, INPUT_RECORD[] lpBuffer, uint nLength, ref uint lpNumberOfEventsWritten);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool AttachConsole(uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+        public static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll")]
+        public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);    
+
+        public const uint CTRL_C_EVENT = 0;
     }
 
     public class StreamPipe
