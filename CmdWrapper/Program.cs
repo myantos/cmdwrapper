@@ -38,8 +38,7 @@ namespace CmdWrapper
             _actionQueue = new BlockingCollection<Action>(new ConcurrentQueue<Action>());
 
             Console.CancelKeyPress += OnCancelKeyPress;
-            MouseEvent += OnMouseEvent;
-
+            
             InitConsoleMode();
             StartCmd();
             CreatePipes();
@@ -51,9 +50,8 @@ namespace CmdWrapper
         private static void InitConsoleMode()
         {
             IntPtr inHandle = GetStdHandle(STD_INPUT_HANDLE);
-            uint mode = 0;
-
-            GetConsoleMode(inHandle, ref mode);
+            
+            GetConsoleMode(inHandle, out uint mode);
 
             mode &= ~ENABLE_LINE_INPUT; //disable
             mode &= ~ENABLE_QUICK_EDIT_MODE; //disable
@@ -160,34 +158,30 @@ namespace CmdWrapper
         private static void OnMouseEvent(MOUSE_EVENT_RECORD r)
         {
             if ((r.dwButtonState & MOUSE_EVENT_RECORD.FROM_LEFT_1ST_BUTTON_PRESSED) == MOUSE_EVENT_RECORD.FROM_LEFT_1ST_BUTTON_PRESSED)
-            {
-                var mouseX = r.dwMousePosition.X;
+            {                
+                _consolePipe.EnableEditMode();
+
                 var mouseY = r.dwMousePosition.Y;
 
-                DoInMainThread(() =>
+                if (mouseY < _consolePipe.CommandModeTop)
                 {
-                    _consolePipe.EnableEditMode();
+                    Console.SetCursorPosition(r.dwMousePosition.X, mouseY);
+                    return;
+                }
+                else if (mouseY == _consolePipe.CommandModeTop)
+                {
+                    var mouseX = r.dwMousePosition.X;
 
-                    if (mouseY < _consolePipe.CommandModeTop)
+                    if (mouseX < _consolePipe.CommandModeLeft)
                     {
                         Console.SetCursorPosition(mouseX, mouseY);
                         return;
                     }
-                    else if (mouseY == _consolePipe.CommandModeTop)
-                    {
-                        if (mouseX < _consolePipe.CommandModeLeft)
-                        {
-                            Console.SetCursorPosition(mouseX, mouseY);
-                            return;
-                        }
-                    }
+                }
 
-                    _consolePipe.EnableCommandMode();
-                });
+                _consolePipe.EnableCommandMode();
             }
         }
-
-        private static event ConsoleMouseEvent MouseEvent;
 
         private static void StartConsoleListener()
         {
@@ -199,44 +193,69 @@ namespace CmdWrapper
 
         private static void ConsoleListener()
         {
-            var keyEventProcessed = new AutoResetEvent(false);
+            var inputProcessed = new AutoResetEvent(false);
             var handleIn = GetStdHandle(STD_INPUT_HANDLE);
             var buffer = new INPUT_RECORD[1];
-            var record = buffer[0];
-
+            
             while (true)
             {
-                uint numRead = 0;
+                WaitForSingleObject(handleIn, INFINITE);
 
-                ReadConsoleInput(handleIn, buffer, 1, ref numRead);
-
-                if (numRead == 1)
+                DoInMainThread(() =>
                 {
-                    switch (buffer[0].EventType)
+                    try
                     {
-                        case INPUT_RECORD.MOUSE_EVENT:
-                            MouseEvent?.Invoke(buffer[0].MouseEvent);
-                            break;
+                        ReadConsoleInput(handleIn, buffer, 1, out uint numRead);
 
-                        case INPUT_RECORD.KEY_EVENT:
-                            keyEventProcessed.Reset();
-
-                            DoInMainThread(() =>
+                        if (numRead == 1)
+                        {
+                            switch (buffer[0].EventType)
                             {
-                                uint numWritten = 0;
+                                case INPUT_RECORD.MOUSE_EVENT:
+                                    OnMouseEvent(buffer[0].MouseEvent);
+                                    break;
 
-                                WriteConsoleInput(handleIn, buffer, 1, ref numWritten);
+                                case INPUT_RECORD.KEY_EVENT:
 
-                                _consolePipe.Run();
-                                keyEventProcessed.Set();
-                            });
+                                    var remainingInput = ReadBufferedInput(handleIn, out uint inputRead);
 
-                            keyEventProcessed.WaitOne();
+                                    WriteConsoleInput(handleIn, buffer, 1, out uint numWritten);
 
-                            break;
+                                    if (inputRead > 0)
+                                        WriteConsoleInput(handleIn, remainingInput, inputRead, out numWritten);
+
+                                    _consolePipe.Run();
+
+                                    break;
+                            }
+                        }
                     }
-                }
+                    finally
+                    {
+                        inputProcessed.Set();
+                    }
+                });
+
+                inputProcessed.WaitOne();
             }
+        }
+
+        private static INPUT_RECORD[] ReadBufferedInput(IntPtr handleIn, out uint numRead)
+        {
+            uint numEvents;
+
+            GetNumberOfConsoleInputEvents(handleIn, out numEvents);
+
+            if (numEvents > 0)
+            {
+                var buffer = new INPUT_RECORD[numEvents];
+                ReadConsoleInput(handleIn, buffer, numEvents, out numRead);
+
+                return buffer;
+            }
+
+            numRead = 0;
+            return null;
         }
 
         private delegate void ConsoleMouseEvent(MOUSE_EVENT_RECORD r);
@@ -387,17 +406,23 @@ namespace CmdWrapper
             ENABLE_WINDOW_INPUT = 0x0008; //more
 
         [DllImport("kernel32.dll")]
-        public static extern bool GetConsoleMode(IntPtr hConsoleInput, ref uint lpMode);
+        public static extern bool GetConsoleMode(IntPtr hConsoleInput, out uint lpMode);
 
         [DllImport("kernel32.dll")]
         public static extern bool SetConsoleMode(IntPtr hConsoleInput, uint dwMode);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-        public static extern bool ReadConsoleInput(IntPtr hConsoleInput, [Out] INPUT_RECORD[] lpBuffer, uint nLength, ref uint lpNumberOfEventsRead);
+        public static extern bool ReadConsoleInput(IntPtr hConsoleInput, [Out] INPUT_RECORD[] lpBuffer, uint nLength, out uint lpNumberOfEventsRead);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-        public static extern bool WriteConsoleInput(IntPtr hConsoleInput, INPUT_RECORD[] lpBuffer, uint nLength, ref uint lpNumberOfEventsWritten);
+        public static extern bool WriteConsoleInput(IntPtr hConsoleInput, INPUT_RECORD[] lpBuffer, uint nLength, out uint lpNumberOfEventsWritten);
 
+        [DllImport("kernel32.dll")]
+        public static extern bool FlushConsoleInputBuffer(IntPtr hConsoleInput);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetNumberOfConsoleInputEvents(IntPtr hConsoleInput, out uint lpcNumberOfEvents);
+    
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool AttachConsole(uint dwProcessId);
 
@@ -408,6 +433,11 @@ namespace CmdWrapper
         public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);    
 
         public const uint CTRL_C_EVENT = 0;
+
+        [DllImport("kernel32.dll")]
+        public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        public const uint INFINITE = UInt32.MaxValue;
     }
 
     public class StreamPipe
